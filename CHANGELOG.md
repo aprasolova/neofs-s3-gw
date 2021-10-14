@@ -2,6 +2,22 @@
 
 This document outlines major changes between releases.
 
+## 0.17.1 (30 Aug 2021)
+With this release we introduce [ceph-based](https://github.com/ceph/s3-tests) S3 compatibility results.
+
+### Added
+* Versioning support (#122)
+* Ceph S3 compatibility results (#150)
+* Handling `X-Amz-Expected-Bucket-Owner` header (#216)
+* `X-Container-Id` header for `HeadBucket` response (#220)
+* Basic ACL support (#49, #213)
+* Caching (#206, #179)
+* Metadata directive when copying (#191)
+* Bucket name checking (189)
+* Continuation token support (#112, #154, #180)
+* Mapping `LocationConstraint` to `PlacementPolicy` (#89)
+* Tagging support (#196)
+
 ## 0.17.0 (30 Aug 2021)
 With this release we introduce [ceph-based](https://github.com/ceph/s3-tests) S3 compatibility results.
 
@@ -19,7 +35,7 @@ With this release we introduce [ceph-based](https://github.com/ceph/s3-tests) S3
 * Tagging support (#196)
 
 ### Changed
-* Default placement policy is now configurable (#218) 
+* Default placement policy is now configurable (#218)
 * README is split into different files (#210)
 * Unified error handling (#184, #149, #89)
 * Authmate issue-secret response contains container id (#163)
@@ -62,7 +78,7 @@ cryptography with NEP-6 wallet support.
  * Support of time-based conditional CopyObject and GetObject (#94)
 
 ### Changed
- * Accesskey format: now `0` used as a delimiter between container ID and object 
+ * Accesskey format: now `0` used as a delimiter between container ID and object
    ID instead of `_` (#164)
  * Accessbox is encoded in protobuf format (#48)
  * Authentication uses secp256r1 instead of ed25519 (#75)

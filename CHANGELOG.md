@@ -2,7 +2,7 @@
 
 This document outlines major changes between releases.
 
-## 0.17.1 (30 Aug 2021)
+## 0.17.3 (30 Aug 2021)
 With this release we introduce [ceph-based](https://github.com/ceph/s3-tests) S3 compatibility results.
 
 ### Added

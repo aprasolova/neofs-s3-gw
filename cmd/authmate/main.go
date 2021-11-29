@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,10 +13,10 @@ import (
 	"time"
 
 	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
-	cid "github.com/nspcc-dev/neofs-api-go/pkg/container/id"
 	"github.com/nspcc-dev/neofs-s3-gw/authmate"
 	"github.com/nspcc-dev/neofs-s3-gw/internal/version"
 	"github.com/nspcc-dev/neofs-s3-gw/internal/wallet"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
 	"github.com/spf13/viper"
 	"github.com/urfave/cli/v2"
@@ -26,8 +27,8 @@ import (
 const (
 	poolConnectTimeout = 5 * time.Second
 	poolRequestTimeout = 5 * time.Second
-	// a number of 15-second blocks in a month.
-	defaultLifetime = 172800
+	// a number of 1-hour epochs in a month.
+	defaultLifetime = 720
 )
 
 var (
@@ -45,8 +46,9 @@ var (
 	logEnabledFlag         bool
 	logDebugEnabledFlag    bool
 	sessionTokenFlag       bool
-	lifetimeFlag           uint64
+	lifetimeFlag           time.Duration
 	containerPolicies      string
+	awcCliCredFile         string
 )
 
 const (
@@ -196,9 +198,9 @@ func issueSecret() *cli.Command {
 				Destination: &sessionTokenFlag,
 				Value:       false,
 			},
-			&cli.Uint64Flag{
+			&cli.DurationFlag{
 				Name:        "lifetime",
-				Usage:       "Lifetime of tokens in NeoFS epoch (number of blocks in sidechain)",
+				Usage:       "Lifetime of tokens (e.g. 1d2h30m, it will be ceil rounded to the nearest amount of epoch)",
 				Required:    false,
 				Destination: &lifetimeFlag,
 				Value:       defaultLifetime,
@@ -208,6 +210,12 @@ func issueSecret() *cli.Command {
 				Usage:       "mapping AWS storage class to NeoFS storage policy as plain json string or path to json file",
 				Required:    false,
 				Destination: &containerPolicies,
+			},
+			&cli.StringFlag{
+				Name:        "aws-cli-credentials",
+				Usage:       "path to the aws cli credential file",
+				Required:    false,
+				Destination: &awcCliCredFile,
 			},
 		},
 		Action: func(c *cli.Context) error {
@@ -246,7 +254,7 @@ func issueSecret() *cli.Command {
 			}
 
 			if lifetimeFlag <= 0 {
-				return cli.Exit(fmt.Sprintf("lifetime must be at least 1, current value: %d", lifetimeFlag), 5)
+				return cli.Exit(fmt.Sprintf("lifetime must be greater 0, current value: %d", lifetimeFlag), 5)
 			}
 
 			policies, err := parsePolicies(containerPolicies)
@@ -264,6 +272,7 @@ func issueSecret() *cli.Command {
 				ContainerPolicies:     policies,
 				SessionTkn:            sessionTokenFlag,
 				Lifetime:              lifetimeFlag,
+				AwsCliCredentialsFile: awcCliCredFile,
 			}
 
 			if err = agent.IssueSecret(ctx, os.Stdout, issueSecretOptions); err != nil {
@@ -398,9 +407,10 @@ func createSDKClient(ctx context.Context, log *zap.Logger, key *ecdsa.PrivateKey
 	pb.AddNode(peerAddress, 1)
 
 	opts := &pool.BuilderOptions{
-		Key:                   key,
-		NodeConnectionTimeout: poolConnectTimeout,
-		NodeRequestTimeout:    poolRequestTimeout,
+		Key:                    key,
+		NodeConnectionTimeout:  poolConnectTimeout,
+		NodeRequestTimeout:     poolRequestTimeout,
+		SessionExpirationEpoch: math.MaxUint32,
 	}
 	return pb.Build(ctx, opts)
 }

@@ -7,21 +7,24 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/nspcc-dev/neofs-api-go/pkg/acl/eacl"
-	"github.com/nspcc-dev/neofs-api-go/pkg/client"
-	cid "github.com/nspcc-dev/neofs-api-go/pkg/container/id"
-	"github.com/nspcc-dev/neofs-api-go/pkg/netmap"
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
-	"github.com/nspcc-dev/neofs-api-go/pkg/owner"
+	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
 	"github.com/nspcc-dev/neofs-s3-gw/api"
 	"github.com/nspcc-dev/neofs-s3-gw/api/cache"
+	"github.com/nspcc-dev/neofs-s3-gw/api/data"
 	"github.com/nspcc-dev/neofs-s3-gw/api/errors"
+	"github.com/nspcc-dev/neofs-s3-gw/authmate"
 	"github.com/nspcc-dev/neofs-s3-gw/creds/accessbox"
+	"github.com/nspcc-dev/neofs-sdk-go/client"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	"github.com/nspcc-dev/neofs-sdk-go/eacl"
+	"github.com/nspcc-dev/neofs-sdk-go/netmap"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
+	"github.com/nspcc-dev/neofs-sdk-go/owner"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
+	"github.com/nspcc-dev/neofs-sdk-go/session"
 	"go.uber.org/zap"
 )
 
@@ -29,18 +32,26 @@ type (
 	layer struct {
 		pool        pool.Pool
 		log         *zap.Logger
-		listsCache  ObjectsListCache
-		objCache    cache.ObjectsCache
-		namesCache  cache.ObjectsNameCache
-		bucketCache cache.BucketCache
-		systemCache cache.SystemCache
+		anonKey     AnonymousKey
+		listsCache  *cache.ObjectsListCache
+		objCache    *cache.ObjectsCache
+		namesCache  *cache.ObjectsNameCache
+		bucketCache *cache.BucketCache
+		systemCache *cache.SystemCache
 	}
 
-	// CacheConfig contains params for caches.
-	CacheConfig struct {
-		Lifetime            time.Duration
-		Size                int
-		ListObjectsLifetime time.Duration
+	// AnonymousKey contains data for anonymous requests.
+	AnonymousKey struct {
+		Key *keys.PrivateKey
+	}
+
+	// CachesConfig contains params for caches.
+	CachesConfig struct {
+		Objects     *cache.Config
+		ObjectsList *cache.Config
+		Names       *cache.Config
+		Buckets     *cache.Config
+		System      *cache.Config
 	}
 
 	// Params stores basic API parameters.
@@ -54,7 +65,7 @@ type (
 	// GetObjectParams stores object get request parameters.
 	GetObjectParams struct {
 		Range      *RangeParams
-		ObjectInfo *ObjectInfo
+		ObjectInfo *data.ObjectInfo
 		Offset     int64
 		Length     int64
 		Writer     io.Writer
@@ -89,6 +100,12 @@ type (
 		Settings *BucketSettings
 	}
 
+	// PutCORSParams stores PutCORS request parameters.
+	PutCORSParams struct {
+		BktInfo *data.BucketInfo
+		Reader  io.Reader
+	}
+
 	// BucketSettings stores settings such as versioning.
 	BucketSettings struct {
 		VersioningEnabled bool
@@ -96,7 +113,7 @@ type (
 
 	// CopyObjectParams stores object copy request parameters.
 	CopyObjectParams struct {
-		SrcObject *ObjectInfo
+		SrcObject *data.ObjectInfo
 		DstBucket string
 		DstObject string
 		SrcSize   int64
@@ -104,11 +121,11 @@ type (
 	}
 	// CreateBucketParams stores bucket create request parameters.
 	CreateBucketParams struct {
-		Name    string
-		ACL     uint32
-		Policy  *netmap.PlacementPolicy
-		EACL    *eacl.Table
-		BoxData *accessbox.Box
+		Name         string
+		ACL          uint32
+		Policy       *netmap.PlacementPolicy
+		EACL         *eacl.Table
+		SessionToken *session.Token
 	}
 	// PutBucketACLParams stores put bucket acl request parameters.
 	PutBucketACLParams struct {
@@ -119,6 +136,16 @@ type (
 	DeleteBucketParams struct {
 		Name string
 	}
+
+	// PutSystemObjectParams stores putSystemObject parameters.
+	PutSystemObjectParams struct {
+		BktInfo  *data.BucketInfo
+		ObjName  string
+		Metadata map[string]string
+		Prefix   string
+		Reader   io.Reader
+	}
+
 	// ListObjectVersionsParams stores list objects versions parameters.
 	ListObjectVersionsParams struct {
 		Bucket          string
@@ -130,15 +157,17 @@ type (
 		Encode          string
 	}
 
-	// VersionedObject stores object name and version.
+	// VersionedObject stores info about objects to delete.
 	VersionedObject struct {
-		Name      string
-		VersionID string
+		Name              string
+		VersionID         string
+		DeleteMarkVersion string
+		Error             error
 	}
 
 	// PutTaggingParams stores tag set params.
 	PutTaggingParams struct {
-		ObjectInfo *ObjectInfo
+		ObjectInfo *data.ObjectInfo
 		TagSet     map[string]string
 	}
 
@@ -151,33 +180,39 @@ type (
 	Client interface {
 		NeoFS
 
-		PutBucketVersioning(ctx context.Context, p *PutVersioningParams) (*ObjectInfo, error)
+		EphemeralKey() *keys.PublicKey
+
+		PutBucketVersioning(ctx context.Context, p *PutVersioningParams) (*data.ObjectInfo, error)
 		GetBucketVersioning(ctx context.Context, name string) (*BucketSettings, error)
 
-		ListBuckets(ctx context.Context) ([]*cache.BucketInfo, error)
-		GetBucketInfo(ctx context.Context, name string) (*cache.BucketInfo, error)
+		PutBucketCORS(ctx context.Context, p *PutCORSParams) error
+		GetBucketCORS(ctx context.Context, bktInfo *data.BucketInfo) (*data.CORSConfiguration, error)
+		DeleteBucketCORS(ctx context.Context, bktInfo *data.BucketInfo) error
+
+		ListBuckets(ctx context.Context) ([]*data.BucketInfo, error)
+		GetBucketInfo(ctx context.Context, name string) (*data.BucketInfo, error)
 		GetBucketACL(ctx context.Context, name string) (*BucketACL, error)
 		PutBucketACL(ctx context.Context, p *PutBucketACLParams) error
 		CreateBucket(ctx context.Context, p *CreateBucketParams) (*cid.ID, error)
 		DeleteBucket(ctx context.Context, p *DeleteBucketParams) error
 
 		GetObject(ctx context.Context, p *GetObjectParams) error
-		GetObjectInfo(ctx context.Context, p *HeadObjectParams) (*ObjectInfo, error)
-		GetObjectTagging(ctx context.Context, p *ObjectInfo) (map[string]string, error)
+		GetObjectInfo(ctx context.Context, p *HeadObjectParams) (*data.ObjectInfo, error)
+		GetObjectTagging(ctx context.Context, p *data.ObjectInfo) (map[string]string, error)
 		GetBucketTagging(ctx context.Context, bucket string) (map[string]string, error)
 
-		PutObject(ctx context.Context, p *PutObjectParams) (*ObjectInfo, error)
+		PutObject(ctx context.Context, p *PutObjectParams) (*data.ObjectInfo, error)
 		PutObjectTagging(ctx context.Context, p *PutTaggingParams) error
 		PutBucketTagging(ctx context.Context, bucket string, tagSet map[string]string) error
 
-		CopyObject(ctx context.Context, p *CopyObjectParams) (*ObjectInfo, error)
+		CopyObject(ctx context.Context, p *CopyObjectParams) (*data.ObjectInfo, error)
 
 		ListObjectsV1(ctx context.Context, p *ListObjectsParamsV1) (*ListObjectsInfoV1, error)
 		ListObjectsV2(ctx context.Context, p *ListObjectsParamsV2) (*ListObjectsInfoV2, error)
 		ListObjectVersions(ctx context.Context, p *ListObjectVersionsParams) (*ListObjectVersionsInfo, error)
 
-		DeleteObjects(ctx context.Context, bucket string, objects []*VersionedObject) []error
-		DeleteObjectTagging(ctx context.Context, p *ObjectInfo) error
+		DeleteObjects(ctx context.Context, bucket string, objects []*VersionedObject) ([]*VersionedObject, error)
+		DeleteObjectTagging(ctx context.Context, p *data.ObjectInfo) error
 		DeleteBucketTagging(ctx context.Context, bucket string) error
 	}
 )
@@ -191,19 +226,34 @@ func (t *VersionedObject) String() string {
 	return t.Name + ":" + t.VersionID
 }
 
+// DefaultCachesConfigs returns filled configs.
+func DefaultCachesConfigs() *CachesConfig {
+	return &CachesConfig{
+		Objects:     cache.DefaultObjectsConfig(),
+		ObjectsList: cache.DefaultObjectsListConfig(),
+		Names:       cache.DefaultObjectsNameConfig(),
+		Buckets:     cache.DefaultBucketConfig(),
+		System:      cache.DefaultSystemConfig(),
+	}
+}
+
 // NewLayer creates instance of layer. It checks credentials
 // and establishes gRPC connection with node.
-func NewLayer(log *zap.Logger, conns pool.Pool, config *CacheConfig) Client {
+func NewLayer(log *zap.Logger, conns pool.Pool, config *CachesConfig, anonKey AnonymousKey) Client {
 	return &layer{
-		pool:       conns,
-		log:        log,
-		listsCache: newListObjectsCache(config.ListObjectsLifetime),
-		objCache:   cache.New(config.Size, config.Lifetime),
-		//todo reconsider cache params
-		namesCache:  cache.NewObjectsNameCache(1000, time.Minute),
-		bucketCache: cache.NewBucketCache(150, time.Minute),
-		systemCache: cache.NewSystemCache(1000, 5*time.Minute),
+		pool:        conns,
+		log:         log,
+		anonKey:     anonKey,
+		listsCache:  cache.NewObjectsListCache(config.ObjectsList),
+		objCache:    cache.New(config.Objects),
+		namesCache:  cache.NewObjectsNameCache(config.Names),
+		bucketCache: cache.NewBucketCache(config.Buckets),
+		systemCache: cache.NewSystemCache(config.System),
 	}
+}
+
+func (n *layer) EphemeralKey() *keys.PublicKey {
+	return n.anonKey.Key.PublicKey()
 }
 
 // Owner returns owner id from BearerToken (context) or from client owner.
@@ -212,35 +262,36 @@ func (n *layer) Owner(ctx context.Context) *owner.ID {
 		return data.Gate.BearerToken.Issuer()
 	}
 
-	return n.pool.OwnerID()
+	id, _ := authmate.OwnerIDFromNeoFSKey(n.EphemeralKey())
+	return id
 }
 
-// BearerOpt returns client.WithBearer call option with token from context or with nil token.
-func (n *layer) BearerOpt(ctx context.Context) client.CallOption {
+// CallOptions returns []pool.CallOption options: client.WithBearer or client.WithKey (if request is anonymous).
+func (n *layer) CallOptions(ctx context.Context) []pool.CallOption {
 	if data, ok := ctx.Value(api.BoxData).(*accessbox.Box); ok && data != nil && data.Gate != nil {
-		return client.WithBearer(data.Gate.BearerToken)
+		return []pool.CallOption{pool.WithBearer(data.Gate.BearerToken)}
 	}
 
-	return client.WithBearer(nil)
+	return []pool.CallOption{pool.WithKey(&n.anonKey.Key.PrivateKey)}
 }
 
 // SessionOpt returns client.WithSession call option with token from context or with nil token.
-func (n *layer) SessionOpt(ctx context.Context) client.CallOption {
+func (n *layer) SessionOpt(ctx context.Context) pool.CallOption {
 	if data, ok := ctx.Value(api.BoxData).(*accessbox.Box); ok && data != nil && data.Gate != nil {
-		return client.WithSession(data.Gate.SessionToken)
+		return pool.WithSession(data.Gate.SessionToken)
 	}
 
-	return client.WithSession(nil)
+	return pool.WithSession(nil)
 }
 
 // Get NeoFS Object by refs.Address (should be used by auth.Center).
 func (n *layer) Get(ctx context.Context, address *object.Address) (*object.Object, error) {
 	ops := new(client.GetObjectParams).WithAddress(address)
-	return n.pool.GetObject(ctx, ops, n.BearerOpt(ctx))
+	return n.pool.GetObject(ctx, ops, n.CallOptions(ctx)...)
 }
 
 // GetBucketInfo returns bucket info by name.
-func (n *layer) GetBucketInfo(ctx context.Context, name string) (*cache.BucketInfo, error) {
+func (n *layer) GetBucketInfo(ctx context.Context, name string) (*data.BucketInfo, error) {
 	name, err := url.QueryUnescape(name)
 	if err != nil {
 		return nil, err
@@ -298,7 +349,7 @@ func (n *layer) PutBucketACL(ctx context.Context, param *PutBucketACLParams) err
 
 // ListBuckets returns all user containers. Name of the bucket is a container
 // id. Timestamp is omitted since it is not saved in neofs container.
-func (n *layer) ListBuckets(ctx context.Context) ([]*cache.BucketInfo, error) {
+func (n *layer) ListBuckets(ctx context.Context) ([]*data.BucketInfo, error) {
 	return n.containerList(ctx)
 }
 
@@ -308,8 +359,8 @@ func (n *layer) GetObject(ctx context.Context, p *GetObjectParams) error {
 
 	params := &getParams{
 		Writer: p.Writer,
-		cid:    p.ObjectInfo.CID(),
-		oid:    p.ObjectInfo.ID(),
+		cid:    p.ObjectInfo.CID,
+		oid:    p.ObjectInfo.ID,
 		offset: p.Offset,
 		length: p.Length,
 	}
@@ -322,19 +373,19 @@ func (n *layer) GetObject(ctx context.Context, p *GetObjectParams) error {
 		params.Range = objRange
 		_, err = n.objectRange(ctx, params)
 	} else {
-		_, err = n.objectGet(ctx, params)
+		_, err = n.objectGetWithPayloadWriter(ctx, params)
 	}
 
 	if err != nil {
 		n.objCache.Delete(p.ObjectInfo.Address())
-		return fmt.Errorf("couldn't get object, cid: %s : %w", p.ObjectInfo.CID(), err)
+		return fmt.Errorf("couldn't get object, cid: %s : %w", p.ObjectInfo.CID, err)
 	}
 
 	return nil
 }
 
 // GetObjectInfo returns meta information about the object.
-func (n *layer) GetObjectInfo(ctx context.Context, p *HeadObjectParams) (*ObjectInfo, error) {
+func (n *layer) GetObjectInfo(ctx context.Context, p *HeadObjectParams) (*data.ObjectInfo, error) {
 	bkt, err := n.GetBucketInfo(ctx, p.Bucket)
 	if err != nil {
 		n.log.Error("could not fetch bucket info", zap.Error(err))
@@ -349,7 +400,7 @@ func (n *layer) GetObjectInfo(ctx context.Context, p *HeadObjectParams) (*Object
 }
 
 // PutObject into storage.
-func (n *layer) PutObject(ctx context.Context, p *PutObjectParams) (*ObjectInfo, error) {
+func (n *layer) PutObject(ctx context.Context, p *PutObjectParams) (*data.ObjectInfo, error) {
 	bkt, err := n.GetBucketInfo(ctx, p.Bucket)
 	if err != nil {
 		return nil, err
@@ -359,14 +410,14 @@ func (n *layer) PutObject(ctx context.Context, p *PutObjectParams) (*ObjectInfo,
 }
 
 // GetObjectTagging from storage.
-func (n *layer) GetObjectTagging(ctx context.Context, oi *ObjectInfo) (map[string]string, error) {
-	bktInfo := &cache.BucketInfo{
+func (n *layer) GetObjectTagging(ctx context.Context, oi *data.ObjectInfo) (map[string]string, error) {
+	bktInfo := &data.BucketInfo{
 		Name:  oi.Bucket,
-		CID:   oi.CID(),
+		CID:   oi.CID,
 		Owner: oi.Owner,
 	}
 
-	objInfo, err := n.getSystemObject(ctx, bktInfo, oi.TagsObject())
+	objInfo, err := n.headSystemObject(ctx, bktInfo, oi.TagsObject())
 	if err != nil && !errors.IsS3Error(err, errors.ErrNoSuchKey) {
 		return nil, err
 	}
@@ -381,7 +432,8 @@ func (n *layer) GetBucketTagging(ctx context.Context, bucketName string) (map[st
 		return nil, err
 	}
 
-	objInfo, err := n.getSystemObject(ctx, bktInfo, formBucketTagObjectName(bucketName))
+	objInfo, err := n.headSystemObject(ctx, bktInfo, formBucketTagObjectName(bucketName))
+
 	if err != nil && !errors.IsS3Error(err, errors.ErrNoSuchKey) {
 		return nil, err
 	}
@@ -389,7 +441,7 @@ func (n *layer) GetBucketTagging(ctx context.Context, bucketName string) (map[st
 	return formTagSet(objInfo), nil
 }
 
-func formTagSet(objInfo *ObjectInfo) map[string]string {
+func formTagSet(objInfo *data.ObjectInfo) map[string]string {
 	var tagSet map[string]string
 	if objInfo != nil {
 		tagSet = make(map[string]string, len(objInfo.Headers))
@@ -407,13 +459,21 @@ func formTagSet(objInfo *ObjectInfo) map[string]string {
 
 // PutObjectTagging into storage.
 func (n *layer) PutObjectTagging(ctx context.Context, p *PutTaggingParams) error {
-	bktInfo := &cache.BucketInfo{
+	bktInfo := &data.BucketInfo{
 		Name:  p.ObjectInfo.Bucket,
-		CID:   p.ObjectInfo.CID(),
+		CID:   p.ObjectInfo.CID,
 		Owner: p.ObjectInfo.Owner,
 	}
 
-	if _, err := n.putSystemObject(ctx, bktInfo, p.ObjectInfo.TagsObject(), p.TagSet, tagPrefix); err != nil {
+	s := &PutSystemObjectParams{
+		BktInfo:  bktInfo,
+		ObjName:  p.ObjectInfo.TagsObject(),
+		Metadata: p.TagSet,
+		Prefix:   tagPrefix,
+		Reader:   nil,
+	}
+
+	if _, err := n.putSystemObject(ctx, s); err != nil {
 		return err
 	}
 
@@ -427,7 +487,15 @@ func (n *layer) PutBucketTagging(ctx context.Context, bucketName string, tagSet 
 		return err
 	}
 
-	if _, err = n.putSystemObject(ctx, bktInfo, formBucketTagObjectName(bucketName), tagSet, tagPrefix); err != nil {
+	s := &PutSystemObjectParams{
+		BktInfo:  bktInfo,
+		ObjName:  formBucketTagObjectName(bucketName),
+		Metadata: tagSet,
+		Prefix:   tagPrefix,
+		Reader:   nil,
+	}
+
+	if _, err = n.putSystemObject(ctx, s); err != nil {
 		return err
 	}
 
@@ -435,31 +503,12 @@ func (n *layer) PutBucketTagging(ctx context.Context, bucketName string, tagSet 
 }
 
 // DeleteObjectTagging from storage.
-func (n *layer) DeleteObjectTagging(ctx context.Context, p *ObjectInfo) error {
+func (n *layer) DeleteObjectTagging(ctx context.Context, p *data.ObjectInfo) error {
 	bktInfo, err := n.GetBucketInfo(ctx, p.Bucket)
 	if err != nil {
 		return err
 	}
 	return n.deleteSystemObject(ctx, bktInfo, p.TagsObject())
-}
-
-func (n *layer) deleteSystemObject(ctx context.Context, bktInfo *cache.BucketInfo, name string) error {
-	var oid *object.ID
-	if meta := n.systemCache.Get(bktInfo.SystemObjectKey(name)); meta != nil {
-		oid = meta.ID()
-	} else {
-		var err error
-		oid, err = n.objectFindID(ctx, &findParams{cid: bktInfo.CID, attr: objectSystemAttributeName, val: name})
-		if err != nil {
-			if errors.IsS3Error(err, errors.ErrNoSuchKey) {
-				return nil
-			}
-			return err
-		}
-	}
-
-	n.systemCache.Delete(bktInfo.SystemObjectKey(name))
-	return n.objectDelete(ctx, bktInfo.CID, oid)
 }
 
 // DeleteBucketTagging from storage.
@@ -472,96 +521,8 @@ func (n *layer) DeleteBucketTagging(ctx context.Context, bucketName string) erro
 	return n.deleteSystemObject(ctx, bktInfo, formBucketTagObjectName(bucketName))
 }
 
-func (n *layer) putSystemObject(ctx context.Context, bktInfo *cache.BucketInfo, objName string, metadata map[string]string, prefix string) (*object.Object, error) {
-	var (
-		err    error
-		oldOID *object.ID
-	)
-	if meta := n.systemCache.Get(bktInfo.SystemObjectKey(objName)); meta != nil {
-		oldOID = meta.ID()
-	} else {
-		oldOID, err = n.objectFindID(ctx, &findParams{cid: bktInfo.CID, attr: objectSystemAttributeName, val: objName})
-		if err != nil && !errors.IsS3Error(err, errors.ErrNoSuchKey) {
-			return nil, err
-		}
-	}
-
-	attributes := make([]*object.Attribute, 0, 3)
-
-	filename := object.NewAttribute()
-	filename.SetKey(objectSystemAttributeName)
-	filename.SetValue(objName)
-
-	createdAt := object.NewAttribute()
-	createdAt.SetKey(object.AttributeTimestamp)
-	createdAt.SetValue(strconv.FormatInt(time.Now().UTC().Unix(), 10))
-
-	versioningIgnore := object.NewAttribute()
-	versioningIgnore.SetKey(attrVersionsIgnore)
-	versioningIgnore.SetValue(strconv.FormatBool(true))
-
-	attributes = append(attributes, filename, createdAt, versioningIgnore)
-
-	for k, v := range metadata {
-		attr := object.NewAttribute()
-		attr.SetKey(prefix + k)
-		if prefix == tagPrefix && v == "" {
-			v = tagEmptyMark
-		}
-		attr.SetValue(v)
-		attributes = append(attributes, attr)
-	}
-
-	raw := object.NewRaw()
-	raw.SetOwnerID(bktInfo.Owner)
-	raw.SetContainerID(bktInfo.CID)
-	raw.SetAttributes(attributes...)
-
-	ops := new(client.PutObjectParams).WithObject(raw.Object())
-	oid, err := n.pool.PutObject(ctx, ops, n.BearerOpt(ctx))
-	if err != nil {
-		return nil, err
-	}
-
-	meta, err := n.objectHead(ctx, bktInfo.CID, oid)
-	if err != nil {
-		return nil, err
-	}
-	if err = n.systemCache.Put(bktInfo.SystemObjectKey(objName), meta); err != nil {
-		n.log.Error("couldn't cache system object", zap.Error(err))
-	}
-	if oldOID != nil {
-		if err = n.objectDelete(ctx, bktInfo.CID, oldOID); err != nil {
-			return nil, err
-		}
-	}
-
-	return meta, nil
-}
-
-func (n *layer) getSystemObject(ctx context.Context, bkt *cache.BucketInfo, objName string) (*ObjectInfo, error) {
-	if meta := n.systemCache.Get(bkt.SystemObjectKey(objName)); meta != nil {
-		return objInfoFromMeta(bkt, meta), nil
-	}
-
-	oid, err := n.objectFindID(ctx, &findParams{cid: bkt.CID, attr: objectSystemAttributeName, val: objName})
-	if err != nil {
-		return nil, err
-	}
-
-	meta, err := n.objectHead(ctx, bkt.CID, oid)
-	if err != nil {
-		return nil, err
-	}
-	if err = n.systemCache.Put(bkt.SystemObjectKey(objName), meta); err != nil {
-		n.log.Error("couldn't cache system object", zap.Error(err))
-	}
-
-	return objInfoFromMeta(bkt, meta), nil
-}
-
 // CopyObject from one bucket into another bucket.
-func (n *layer) CopyObject(ctx context.Context, p *CopyObjectParams) (*ObjectInfo, error) {
+func (n *layer) CopyObject(ctx context.Context, p *CopyObjectParams) (*data.ObjectInfo, error) {
 	pr, pw := io.Pipe()
 
 	go func() {
@@ -585,7 +546,7 @@ func (n *layer) CopyObject(ctx context.Context, p *CopyObjectParams) (*ObjectInf
 }
 
 // DeleteObject removes all objects with passed nice name.
-func (n *layer) deleteObject(ctx context.Context, bkt *cache.BucketInfo, obj *VersionedObject) error {
+func (n *layer) deleteObject(ctx context.Context, bkt *data.BucketInfo, obj *VersionedObject) *VersionedObject {
 	var (
 		err error
 		ids []*object.ID
@@ -593,7 +554,8 @@ func (n *layer) deleteObject(ctx context.Context, bkt *cache.BucketInfo, obj *Ve
 
 	versioningEnabled := n.isVersioningEnabled(ctx, bkt)
 	if !versioningEnabled && obj.VersionID != unversionedObjectVersionID && obj.VersionID != "" {
-		return errors.GetAPIError(errors.ErrInvalidVersion)
+		obj.Error = errors.GetAPIError(errors.ErrInvalidVersion)
+		return obj
 	}
 
 	if versioningEnabled {
@@ -603,54 +565,63 @@ func (n *layer) deleteObject(ctx context.Context, bkt *cache.BucketInfo, obj *Ve
 			Header: map[string]string{versionsDeleteMarkAttr: obj.VersionID},
 		}
 		if len(obj.VersionID) != 0 {
-			id, err := n.checkVersionsExist(ctx, bkt, obj)
+			version, err := n.checkVersionsExist(ctx, bkt, obj)
 			if err != nil {
-				return err
+				obj.Error = err
+				return obj
 			}
-			ids = []*object.ID{id}
+			ids = []*object.ID{version.ID}
+			if version.Headers[versionsDeleteMarkAttr] == delMarkFullObject {
+				obj.DeleteMarkVersion = version.Version()
+			}
 
 			p.Header[versionsDelAttr] = obj.VersionID
 		} else {
 			p.Header[versionsDeleteMarkAttr] = delMarkFullObject
 		}
-		if _, err = n.objectPut(ctx, bkt, p); err != nil {
-			return err
+		objInfo, err := n.objectPut(ctx, bkt, p)
+		if err != nil {
+			obj.Error = err
+			return obj
+		}
+		if len(obj.VersionID) == 0 {
+			obj.DeleteMarkVersion = objInfo.Version()
 		}
 	} else {
 		ids, err = n.objectSearch(ctx, &findParams{cid: bkt.CID, val: obj.Name})
 		if err != nil {
-			return err
+			obj.Error = err
+			return obj
 		}
 	}
 
 	for _, id := range ids {
 		if err = n.objectDelete(ctx, bkt.CID, id); err != nil {
-			return err
+			obj.Error = err
+			return obj
 		}
-		if err = n.DeleteObjectTagging(ctx, &ObjectInfo{id: id, Bucket: bkt.Name, Name: obj.Name}); err != nil {
-			return err
+		if err = n.DeleteObjectTagging(ctx, &data.ObjectInfo{ID: id, Bucket: bkt.Name, Name: obj.Name}); err != nil {
+			obj.Error = err
+			return obj
 		}
 	}
+	n.listsCache.CleanCacheEntriesContainingObject(obj.Name, bkt.CID)
 
-	return nil
+	return obj
 }
 
 // DeleteObjects from the storage.
-func (n *layer) DeleteObjects(ctx context.Context, bucket string, objects []*VersionedObject) []error {
-	var errs = make([]error, 0, len(objects))
-
+func (n *layer) DeleteObjects(ctx context.Context, bucket string, objects []*VersionedObject) ([]*VersionedObject, error) {
 	bkt, err := n.GetBucketInfo(ctx, bucket)
 	if err != nil {
-		return append(errs, err)
+		return nil, err
 	}
 
-	for _, obj := range objects {
-		if err := n.deleteObject(ctx, bkt, obj); err != nil {
-			errs = append(errs, &errors.ObjectError{Err: err, Object: obj.Name, Version: obj.VersionID})
-		}
+	for i, obj := range objects {
+		objects[i] = n.deleteObject(ctx, bkt, obj)
 	}
 
-	return errs
+	return objects, nil
 }
 
 func (n *layer) CreateBucket(ctx context.Context, p *CreateBucketParams) (*cid.ID, error) {
@@ -671,7 +642,7 @@ func (n *layer) DeleteBucket(ctx context.Context, p *DeleteBucketParams) error {
 		return err
 	}
 
-	objects, err := n.listSortedObjectsFromNeoFS(ctx, allObjectParams{Bucket: bucketInfo})
+	objects, err := n.listSortedObjects(ctx, allObjectParams{Bucket: bucketInfo})
 	if err != nil {
 		return err
 	}

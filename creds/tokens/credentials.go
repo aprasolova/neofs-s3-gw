@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
-	"github.com/nspcc-dev/neofs-api-go/pkg/client"
-	cid "github.com/nspcc-dev/neofs-api-go/pkg/container/id"
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
-	"github.com/nspcc-dev/neofs-api-go/pkg/owner"
+	"github.com/nspcc-dev/neofs-s3-gw/api/cache"
 	"github.com/nspcc-dev/neofs-s3-gw/creds/accessbox"
+	"github.com/nspcc-dev/neofs-sdk-go/client"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
+	"github.com/nspcc-dev/neofs-sdk-go/owner"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
 )
 
@@ -21,12 +22,13 @@ type (
 	// Credentials is a bearer token get/put interface.
 	Credentials interface {
 		GetBox(context.Context, *object.Address) (*accessbox.Box, error)
-		Put(context.Context, *cid.ID, *owner.ID, *accessbox.AccessBox, ...*keys.PublicKey) (*object.Address, error)
+		Put(context.Context, *cid.ID, *owner.ID, *accessbox.AccessBox, uint64, ...*keys.PublicKey) (*object.Address, error)
 	}
 
 	cred struct {
-		key  *keys.PrivateKey
-		pool pool.Pool
+		key   *keys.PrivateKey
+		pool  pool.Pool
+		cache *cache.AccessBoxCache
 	}
 )
 
@@ -46,8 +48,8 @@ var bufferPool = sync.Pool{
 var _ = New
 
 // New creates new Credentials instance using given cli and key.
-func New(conns pool.Pool, key *keys.PrivateKey) Credentials {
-	return &cred{pool: conns, key: key}
+func New(conns pool.Pool, key *keys.PrivateKey, config *cache.Config) Credentials {
+	return &cred{pool: conns, key: key, cache: cache.NewAccessBoxCache(config)}
 }
 
 func (c *cred) acquireBuffer() *bytes.Buffer {
@@ -59,22 +61,27 @@ func (c *cred) releaseBuffer(buf *bytes.Buffer) {
 	bufferPool.Put(buf)
 }
 
-func (c *cred) GetTokens(ctx context.Context, address *object.Address) (*accessbox.GateData, error) {
-	box, err := c.getAccessBox(ctx, address)
-	if err != nil {
-		return nil, err
-	}
-
-	return box.GetTokens(c.key)
-}
-
 func (c *cred) GetBox(ctx context.Context, address *object.Address) (*accessbox.Box, error) {
+	cachedBox := c.cache.Get(address)
+	if cachedBox != nil {
+		return cachedBox, nil
+	}
+
 	box, err := c.getAccessBox(ctx, address)
 	if err != nil {
 		return nil, err
 	}
 
-	return box.GetBox(c.key)
+	cachedBox, err = box.GetBox(c.key)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = c.cache.Put(address, cachedBox); err != nil {
+		return nil, err
+	}
+
+	return cachedBox, nil
 }
 
 func (c *cred) getAccessBox(ctx context.Context, address *object.Address) (*accessbox.AccessBox, error) {
@@ -100,7 +107,7 @@ func (c *cred) getAccessBox(ctx context.Context, address *object.Address) (*acce
 	return &box, nil
 }
 
-func (c *cred) Put(ctx context.Context, cid *cid.ID, issuer *owner.ID, box *accessbox.AccessBox, keys ...*keys.PublicKey) (*object.Address, error) {
+func (c *cred) Put(ctx context.Context, cid *cid.ID, issuer *owner.ID, box *accessbox.AccessBox, expiration uint64, keys ...*keys.PublicKey) (*object.Address, error) {
 	var (
 		err     error
 		created = strconv.FormatInt(time.Now().Unix(), 10)
@@ -124,10 +131,14 @@ func (c *cred) Put(ctx context.Context, cid *cid.ID, issuer *owner.ID, box *acce
 	filename.SetKey(object.AttributeFileName)
 	filename.SetValue(created + "_access.box")
 
+	expirationAttr := object.NewAttribute()
+	expirationAttr.SetKey("__NEOFS__EXPIRATION_EPOCH")
+	expirationAttr.SetValue(strconv.FormatUint(expiration, 10))
+
 	raw := object.NewRaw()
 	raw.SetContainerID(cid)
 	raw.SetOwnerID(issuer)
-	raw.SetAttributes(filename, timestamp)
+	raw.SetAttributes(filename, timestamp, expirationAttr)
 
 	ops := new(client.PutObjectParams).WithObject(raw.Object()).WithPayloadReader(bytes.NewBuffer(data))
 	oid, err := c.pool.PutObject(

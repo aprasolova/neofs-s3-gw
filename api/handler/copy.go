@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nspcc-dev/neofs-s3-gw/api"
+	"github.com/nspcc-dev/neofs-s3-gw/api/data"
 	"github.com/nspcc-dev/neofs-s3-gw/api/errors"
 	"github.com/nspcc-dev/neofs-s3-gw/api/layer"
 	"go.uber.org/zap"
@@ -32,7 +33,7 @@ func path2BucketObject(path string) (bucket, prefix string) {
 func (h *handler) CopyObjectHandler(w http.ResponseWriter, r *http.Request) {
 	var (
 		err      error
-		info     *layer.ObjectInfo
+		info     *data.ObjectInfo
 		metadata map[string]string
 
 		reqInfo   = api.GetReqInfo(r.Context())
@@ -118,7 +119,7 @@ func (h *handler) CopyObjectHandler(w http.ResponseWriter, r *http.Request) {
 	h.log.Info("object is copied",
 		zap.String("bucket", info.Bucket),
 		zap.String("object", info.Name),
-		zap.Stringer("object_id", info.ID()))
+		zap.Stringer("object_id", info.ID))
 }
 
 func parseCopyObjectArgs(headers http.Header) (*copyObjectArgs, error) {

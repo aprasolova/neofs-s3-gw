@@ -55,12 +55,24 @@ const ( // Settings.
 	cfgRebalanceTimer = "rebalance_timer"
 
 	// Caching.
-	cfgObjectsCacheLifetime     = "cache.lifetime"
-	cfgCacheSize                = "cache.size"
-	cfgListObjectsCacheLifetime = "cache.list_objects_lifetime"
+	cfgObjectsCacheLifetime     = "cache.objects.lifetime"
+	cfgObjectsCacheSize         = "cache.objects.size"
+	cfgListObjectsCacheLifetime = "cache.list.lifetime"
+	cfgListObjectsCacheSize     = "cache.list.size"
+	cfgBucketsCacheLifetime     = "cache.buckets.lifetime"
+	cfgBucketsCacheSize         = "cache.buckets.size"
+	cfgNamesCacheLifetime       = "cache.names.lifetime"
+	cfgNamesCacheSize           = "cache.names.size"
+	cfgSystemLifetimeSize       = "cache.system.lifetime"
+	cfgSystemCacheSize          = "cache.system.size"
+	cfgAccessBoxCacheLifetime   = "cache.accessbox.lifetime"
+	cfgAccessBoxCacheSize       = "cache.accessbox.size"
 
 	// Policy.
 	cfgDefaultPolicy = "default_policy"
+
+	// CORS.
+	cfgDefaultMaxAge = "cors.default_max_age"
 
 	// MaxClients.
 	cfgMaxClientsCount    = "max_clients_count"

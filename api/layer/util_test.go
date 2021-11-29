@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	cid "github.com/nspcc-dev/neofs-api-go/pkg/container/id"
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
-	"github.com/nspcc-dev/neofs-api-go/pkg/owner"
-	"github.com/nspcc-dev/neofs-s3-gw/api/cache"
+	"github.com/nspcc-dev/neofs-s3-gw/api/data"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
+	"github.com/nspcc-dev/neofs-sdk-go/owner"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,7 +20,7 @@ var (
 	defaultTestContentType   = http.DetectContentType(defaultTestPayload)
 )
 
-func newTestObject(oid *object.ID, bkt *cache.BucketInfo, name string) *object.Object {
+func newTestObject(oid *object.ID, bkt *data.BucketInfo, name string) *object.Object {
 	filename := object.NewAttribute()
 	filename.SetKey(object.AttributeFileName)
 	filename.SetValue(name)
@@ -44,12 +44,12 @@ func newTestObject(oid *object.ID, bkt *cache.BucketInfo, name string) *object.O
 	return raw.Object()
 }
 
-func newTestInfo(oid *object.ID, bkt *cache.BucketInfo, name string, isDir bool) *ObjectInfo {
-	info := &ObjectInfo{
-		id:          oid,
+func newTestInfo(oid *object.ID, bkt *data.BucketInfo, name string, isDir bool) *data.ObjectInfo {
+	info := &data.ObjectInfo{
+		ID:          oid,
 		Name:        name,
 		Bucket:      bkt.Name,
-		bucketID:    bkt.CID,
+		CID:         bkt.CID,
 		Size:        defaultTestPayloadLength,
 		ContentType: defaultTestContentType,
 		Created:     time.Unix(defaultTestCreated.Unix(), 0),
@@ -58,7 +58,7 @@ func newTestInfo(oid *object.ID, bkt *cache.BucketInfo, name string, isDir bool)
 	}
 
 	if isDir {
-		info.isDir = true
+		info.IsDir = true
 		info.Size = 0
 		info.ContentType = ""
 		info.Headers = nil
@@ -72,7 +72,7 @@ func Test_objectInfoFromMeta(t *testing.T) {
 	oid := object.NewID()
 	containerID := cid.New()
 
-	bkt := &cache.BucketInfo{
+	bkt := &data.BucketInfo{
 		Name:    "test-container",
 		CID:     containerID,
 		Owner:   uid,
@@ -82,7 +82,7 @@ func Test_objectInfoFromMeta(t *testing.T) {
 	cases := []struct {
 		name      string
 		prefix    string
-		result    *ObjectInfo
+		result    *data.ObjectInfo
 		object    *object.Object
 		delimiter string
 	}{

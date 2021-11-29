@@ -4,41 +4,42 @@ import (
 	"time"
 
 	"github.com/bluele/gcache"
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
+	"github.com/nspcc-dev/neofs-s3-gw/api/data"
 )
 
-type (
-	// SystemCache provides interface for lru cache for objects.
-	// This cache contains "system" objects (bucket versioning settings, tagging object etc.).
-	// Key is bucketName+systemFileName.
-	SystemCache interface {
-		Get(key string) *object.Object
-		Put(key string, obj *object.Object) error
-		Delete(key string) bool
-	}
-
-	// SysCache contains cache with objects and lifetime of cache entries.
-	SysCache struct {
-		cache    gcache.Cache
-		lifetime time.Duration
-	}
-)
-
-// NewSystemCache creates an object of SystemCache.
-func NewSystemCache(cacheSize int, lifetime time.Duration) *SysCache {
-	gc := gcache.New(cacheSize).LRU().Build()
-
-	return &SysCache{cache: gc, lifetime: lifetime}
+// SystemCache provides lru cache for objects.
+// This cache contains "system" objects (bucket versioning settings, tagging object etc.).
+// Key is bucketName+systemFileName.
+type SystemCache struct {
+	cache gcache.Cache
 }
 
-// Get returns cached object.
-func (o *SysCache) Get(key string) *object.Object {
+const (
+	// DefaultSystemCacheSize is a default maximum number of entries in cache.
+	DefaultSystemCacheSize = 1e4
+	// DefaultSystemCacheLifetime is a default lifetime of entries in  cache.
+	DefaultSystemCacheLifetime = 5 * time.Minute
+)
+
+// DefaultSystemConfig return new default cache expiration values.
+func DefaultSystemConfig() *Config {
+	return &Config{Size: DefaultSystemCacheSize, Lifetime: DefaultSystemCacheLifetime}
+}
+
+// NewSystemCache creates an object of SystemCache.
+func NewSystemCache(config *Config) *SystemCache {
+	gc := gcache.New(config.Size).LRU().Expiration(config.Lifetime).Build()
+	return &SystemCache{cache: gc}
+}
+
+// GetObject returns cached object.
+func (o *SystemCache) GetObject(key string) *data.ObjectInfo {
 	entry, err := o.cache.Get(key)
 	if err != nil {
 		return nil
 	}
 
-	result, ok := entry.(*object.Object)
+	result, ok := entry.(*data.ObjectInfo)
 	if !ok {
 		return nil
 	}
@@ -46,12 +47,30 @@ func (o *SysCache) Get(key string) *object.Object {
 	return result
 }
 
-// Put puts an object to cache.
-func (o *SysCache) Put(key string, obj *object.Object) error {
-	return o.cache.SetWithExpire(key, obj, o.lifetime)
+func (o *SystemCache) GetCORS(key string) *data.CORSConfiguration {
+	entry, err := o.cache.Get(key)
+	if err != nil {
+		return nil
+	}
+
+	result, ok := entry.(*data.CORSConfiguration)
+	if !ok {
+		return nil
+	}
+
+	return result
+}
+
+// PutObject puts an object to cache.
+func (o *SystemCache) PutObject(key string, obj *data.ObjectInfo) error {
+	return o.cache.Set(key, obj)
+}
+
+func (o *SystemCache) PutCORS(key string, obj *data.CORSConfiguration) error {
+	return o.cache.Set(key, obj)
 }
 
 // Delete deletes an object from cache.
-func (o *SysCache) Delete(key string) bool {
+func (o *SystemCache) Delete(key string) bool {
 	return o.cache.Remove(key)
 }

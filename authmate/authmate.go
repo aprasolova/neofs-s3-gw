@@ -3,28 +3,31 @@ package authmate
 import (
 	"context"
 	"crypto/ecdsa"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nspcc-dev/neo-go/pkg/crypto/keys"
-	"github.com/nspcc-dev/neofs-api-go/pkg/acl/eacl"
-	"github.com/nspcc-dev/neofs-api-go/pkg/container"
-	cid "github.com/nspcc-dev/neofs-api-go/pkg/container/id"
-	"github.com/nspcc-dev/neofs-api-go/pkg/netmap"
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
-	"github.com/nspcc-dev/neofs-api-go/pkg/owner"
-	"github.com/nspcc-dev/neofs-api-go/pkg/session"
-	"github.com/nspcc-dev/neofs-api-go/pkg/token"
+	"github.com/nspcc-dev/neofs-s3-gw/api/cache"
 	"github.com/nspcc-dev/neofs-s3-gw/creds/accessbox"
 	"github.com/nspcc-dev/neofs-s3-gw/creds/tokens"
+	"github.com/nspcc-dev/neofs-sdk-go/container"
+	cid "github.com/nspcc-dev/neofs-sdk-go/container/id"
+	"github.com/nspcc-dev/neofs-sdk-go/eacl"
+	"github.com/nspcc-dev/neofs-sdk-go/netmap"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
+	"github.com/nspcc-dev/neofs-sdk-go/owner"
 	"github.com/nspcc-dev/neofs-sdk-go/policy"
 	"github.com/nspcc-dev/neofs-sdk-go/pool"
+	"github.com/nspcc-dev/neofs-sdk-go/session"
+	"github.com/nspcc-dev/neofs-sdk-go/token"
 	"go.uber.org/zap"
 )
 
@@ -56,7 +59,8 @@ type (
 		EACLRules             []byte
 		ContextRules          []byte
 		SessionTkn            bool
-		Lifetime              uint64
+		Lifetime              time.Duration
+		AwsCliCredentialsFile string
 		ContainerPolicies     ContainerPolicies
 	}
 
@@ -71,6 +75,12 @@ type (
 type lifetimeOptions struct {
 	Iat uint64
 	Exp uint64
+}
+
+type epochDurations struct {
+	currentEpoch  uint64
+	msPerBlock    int64
+	blocksInEpoch uint64
 }
 
 type (
@@ -116,13 +126,30 @@ func (a *Agent) checkContainer(ctx context.Context, cid *cid.ID, friendlyName st
 	return cid, nil
 }
 
-func (a *Agent) getCurrentEpoch(ctx context.Context) (uint64, error) {
+func (a *Agent) getEpochDurations(ctx context.Context) (*epochDurations, error) {
 	if conn, _, err := a.pool.Connection(); err != nil {
-		return 0, err
+		return nil, err
 	} else if networkInfo, err := conn.NetworkInfo(ctx); err != nil {
-		return 0, err
+		return nil, err
 	} else {
-		return networkInfo.CurrentEpoch(), nil
+		res := &epochDurations{
+			currentEpoch: networkInfo.CurrentEpoch(),
+			msPerBlock:   networkInfo.MsPerBlock(),
+		}
+
+		networkInfo.NetworkConfig().IterateParameters(func(parameter *netmap.NetworkParameter) bool {
+			if string(parameter.Key()) == "EpochDuration" {
+				data := make([]byte, 8)
+				copy(data, parameter.Value())
+				res.blocksInEpoch = binary.LittleEndian.Uint64(data)
+				return true
+			}
+			return false
+		})
+		if res.blocksInEpoch == 0 {
+			return nil, fmt.Errorf("not found param: EpochDuration")
+		}
+		return res, nil
 	}
 }
 
@@ -179,15 +206,21 @@ func (a *Agent) IssueSecret(ctx context.Context, w io.Writer, options *IssueSecr
 		return err
 	}
 
-	lifetime.Iat, err = a.getCurrentEpoch(ctx)
+	durations, err := a.getEpochDurations(ctx)
 	if err != nil {
 		return err
 	}
+	lifetime.Iat = durations.currentEpoch
+	msPerEpoch := durations.blocksInEpoch * uint64(durations.msPerBlock)
+	epochLifetime := uint64(options.Lifetime.Milliseconds()) / msPerEpoch
+	if uint64(options.Lifetime.Milliseconds())%msPerEpoch != 0 {
+		epochLifetime++
+	}
 
-	if options.Lifetime >= math.MaxUint64-lifetime.Iat {
+	if epochLifetime >= math.MaxUint64-lifetime.Iat {
 		lifetime.Exp = math.MaxUint64
 	} else {
-		lifetime.Exp = lifetime.Iat + options.Lifetime
+		lifetime.Exp = lifetime.Iat + epochLifetime
 	}
 
 	a.log.Info("check container", zap.Stringer("cid", options.ContainerID))
@@ -207,7 +240,7 @@ func (a *Agent) IssueSecret(ctx context.Context, w io.Writer, options *IssueSecr
 
 	box.ContainerPolicy = policies
 
-	oid, err := ownerIDFromNeoFSKey(options.NeoFSKey.PublicKey())
+	oid, err := OwnerIDFromNeoFSKey(options.NeoFSKey.PublicKey())
 	if err != nil {
 		return err
 	}
@@ -224,8 +257,8 @@ func (a *Agent) IssueSecret(ctx context.Context, w io.Writer, options *IssueSecr
 	}
 
 	address, err := tokens.
-		New(a.pool, secrets.EphemeralKey).
-		Put(ctx, cid, oid, box, options.GatesPublicKeys...)
+		New(a.pool, secrets.EphemeralKey, cache.DefaultAccessBoxConfig()).
+		Put(ctx, cid, oid, box, lifetime.Exp, options.GatesPublicKeys...)
 	if err != nil {
 		return fmt.Errorf("failed to put bearer token: %w", err)
 	}
@@ -241,13 +274,32 @@ func (a *Agent) IssueSecret(ctx context.Context, w io.Writer, options *IssueSecr
 
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(ir)
+	if err = enc.Encode(ir); err != nil {
+		return err
+	}
+
+	if options.AwsCliCredentialsFile != "" {
+		profileName := "authmate_cred_" + address.ObjectID().String()
+		if _, err = os.Stat(options.AwsCliCredentialsFile); os.IsNotExist(err) {
+			profileName = "default"
+		}
+		file, err := os.OpenFile(options.AwsCliCredentialsFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+		if err != nil {
+			return fmt.Errorf("couldn't open aws cli credentials file: %w", err)
+		}
+		defer file.Close()
+		if _, err = file.WriteString(fmt.Sprintf("\n[%s]\naws_access_key_id = %s\naws_secret_access_key = %s\n",
+			profileName, accessKeyID, secrets.AccessKey)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ObtainSecret receives an existing secret access key from NeoFS and
 // writes to io.Writer the secret access key.
 func (a *Agent) ObtainSecret(ctx context.Context, w io.Writer, options *ObtainSecretOptions) error {
-	bearerCreds := tokens.New(a.pool, options.GatePrivateKey)
+	bearerCreds := tokens.New(a.pool, options.GatePrivateKey, cache.DefaultAccessBoxConfig())
 	address := object.NewAddress()
 	if err := address.Parse(options.SecretAddress); err != nil {
 		return fmt.Errorf("failed to parse secret address: %w", err)
@@ -339,7 +391,7 @@ func buildContext(rules []byte) (*session.ContainerContext, error) {
 }
 
 func buildBearerToken(key *keys.PrivateKey, table *eacl.Table, lifetime lifetimeOptions, gateKey *keys.PublicKey) (*token.BearerToken, error) {
-	oid, err := ownerIDFromNeoFSKey(gateKey)
+	oid, err := OwnerIDFromNeoFSKey(gateKey)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +466,7 @@ func createTokens(options *IssueSecretOptions, lifetime lifetimeOptions, cid *ci
 		if err != nil {
 			return nil, fmt.Errorf("failed to build context for session token: %w", err)
 		}
-		oid, err := ownerIDFromNeoFSKey(options.NeoFSKey.PublicKey())
+		oid, err := OwnerIDFromNeoFSKey(options.NeoFSKey.PublicKey())
 		if err != nil {
 			return nil, err
 		}
@@ -431,7 +483,7 @@ func createTokens(options *IssueSecretOptions, lifetime lifetimeOptions, cid *ci
 	return gates, nil
 }
 
-func ownerIDFromNeoFSKey(key *keys.PublicKey) (*owner.ID, error) {
+func OwnerIDFromNeoFSKey(key *keys.PublicKey) (*owner.ID, error) {
 	wallet, err := owner.NEO3WalletFromPublicKey((*ecdsa.PublicKey)(key))
 	if err != nil {
 		return nil, err

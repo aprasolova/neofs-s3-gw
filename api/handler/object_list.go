@@ -6,10 +6,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nspcc-dev/neofs-api-go/pkg/object"
 	"github.com/nspcc-dev/neofs-s3-gw/api"
+	"github.com/nspcc-dev/neofs-s3-gw/api/data"
 	"github.com/nspcc-dev/neofs-s3-gw/api/errors"
 	"github.com/nspcc-dev/neofs-s3-gw/api/layer"
+	"github.com/nspcc-dev/neofs-sdk-go/object"
 )
 
 // ListObjectsV1Handler handles objects listing requests for API version 1.
@@ -183,11 +184,11 @@ func fillPrefixes(src []string, encode string) []CommonPrefix {
 	return dst
 }
 
-func fillContentsWithOwner(src []*layer.ObjectInfo, encode string) []Object {
+func fillContentsWithOwner(src []*data.ObjectInfo, encode string) []Object {
 	return fillContents(src, encode, true)
 }
 
-func fillContents(src []*layer.ObjectInfo, encode string, fetchOwner bool) []Object {
+func fillContents(src []*data.ObjectInfo, encode string, fetchOwner bool) []Object {
 	var dst []Object
 	for _, obj := range src {
 		res := Object{
